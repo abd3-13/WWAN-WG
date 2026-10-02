@@ -1,0 +1,43 @@
+name: Build and Release KernelSU Module
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. 1.0.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set version
+        run: |
+          VERSION="${{ inputs.version }}"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Prepare module
+        run: |
+          mkdir -p release
+
+          zip -r "release/WWAN-WG-v${VERSION}.zip" . \
+            -x ".git/*" \
+               ".github/*" \
+               "release/*"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "v${{ env.VERSION }}"
+          name: "WWAN-WG v${{ env.VERSION }}"
+          generate_release_notes: true
+          files: |
+            release/WWAN-WG-v${{ env.VERSION }}.zip
