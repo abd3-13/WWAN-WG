@@ -3,4 +3,4 @@ name=WWAN-WG KernelSU Module
 version=0.3.2
 versionCode=5
 author=Abdelah
-description=WG:🟢UP/OK | D:⚙️4067 | R:HEALTHY
+description=Guarded Android cellular gateway over WireGuard, with WebUI status and logs
