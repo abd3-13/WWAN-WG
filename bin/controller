@@ -1,0 +1,725 @@
+#!/system/bin/sh
+# WWAN-WG controller 0.3.2
+# controller {start|stop|restart|daemon|reconcile|status [--json]|health|logs [n]|check-kernel|clear-log|teardown}
+
+set -f                                    # no pathname expansion
+SELF="$0"
+case "$SELF" in /*) ;; *) SELF="$(pwd)/$SELF" ;; esac
+MODDIR="${WWAN_WG_MODDIR:-${SELF%/bin/*}}"
+VERSION="0.3.2"
+SH=/system/bin/sh
+PATH="/system/bin:/system/xbin:/vendor/bin:$PATH:$MODDIR/bin"   # system tools before busybox applets
+export PATH
+
+DATA_DIR="${WWAN_WG_DATA:-/data/adb/wwan-wg}"
+CONF="$DATA_DIR/config.conf"
+LOG_DIR="$DATA_DIR/log"
+RUN_DIR="$DATA_DIR/run"
+LOG="$LOG_DIR/wwan-wg.log"
+PIDFILE="$RUN_DIR/controller.pid"
+HEARTBEAT="$RUN_DIR/heartbeat"
+STATEFILE="$RUN_DIR/status"
+KCACHE="$RUN_DIR/kernel_support"
+mkdir -p "$LOG_DIR" "$RUN_DIR" 2>/dev/null
+
+TAG="ctl"
+LOG_LEVEL="info"; LOG_MAX_KB="512"
+
+log() {
+    _lv="$1"; shift
+    [ "$_lv" = DEBUG ] && [ "$LOG_LEVEL" != debug ] && return 0
+    printf '%s [%s] [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$_lv" "$TAG" "$*" >> "$LOG"
+}
+
+log_rotate() {
+    [ -f "$LOG" ] || return 0
+    _sz="$(wc -c < "$LOG" 2>/dev/null)"
+    [ "${_sz:-0}" -gt $((LOG_MAX_KB * 1024)) ] || return 0
+    [ -f "$LOG.2" ] && mv -f "$LOG.2" "$LOG.3"
+    [ -f "$LOG.1" ] && mv -f "$LOG.1" "$LOG.2"
+    mv -f "$LOG" "$LOG.1"
+    log INFO "log rotated (was ${_sz} bytes)"
+}
+
+# ---------------- defaults, then config (syntax-checked: a bad sourced file would kill the shell)
+WG_IF="wg0"; WG_ADDR="10.200.0.1/24"; WG_NET="10.200.0.0/24"; WG_PORT="51820"
+PRIVATE_KEY="/data/local/wireguard/phone_private.key"
+PI_PUBLIC_KEY=""; PI_ALLOWED_IPS="10.200.0.2/32"
+LAN_IF="wlan0"; LAN_IP="10.4.2.2"; PI_IP="10.4.2.1"; LAN_NET="10.4.2.0/24"
+ROUTE_TABLE="200"; ROUTE_PREF="100"; LAN_RULE_PREF="50"; WG_RULE_PREF="51"
+TEST_IP="1.1.1.1"; FORWARD_CHAIN="WWAN_WG_FORWARD"; NAT_CHAIN="WWAN_WG_NAT"
+UPSTREAM_GLOBS="rmnet_data* v4-rmnet_data* ccmni* v4-ccmni*"; UPSTREAM_IF=""
+RECONCILE_INTERVAL="5"; HEALTH_INTERVAL="30"; HANDSHAKE_TIMEOUT="180"
+PEER_WATCHDOG="1"; PEER_RESET_AFTER="90"; PEER_CHECK_EVERY="10"
+
+if [ -f "$CONF" ]; then
+    if "$SH" -n "$CONF" 2>/dev/null; then
+        . "$CONF"
+    else
+        log ERROR "config $CONF has a syntax error, using built-in defaults"
+    fi
+fi
+WG_IP="${WG_ADDR%/*}"
+STEPS="wireguard forward lan rules upstream fwd nat"
+
+# ---------------- helpers
+now() { date +%s; }
+
+# run <cmd...>: execute and log the outcome. Used for every state-changing command.
+run() {
+    _out="$("$@" 2>&1)"; _rc=$?
+    _out="$(printf '%s' "$_out" | tr '\n' ' ')"
+    if [ "$_rc" -eq 0 ]; then log INFO "ok: $*"; else log ERROR "rc=$_rc: $* :: $_out"; fi
+    return "$_rc"
+}
+
+# iptables: ipx = quiet check, ipr = logged mutation. First argument is the table.
+ipx() { _t="$1"; shift; iptables -w 5 -t "$_t" "$@" >/dev/null 2>&1; }
+ipr() { _t="$1"; shift; run iptables -w 5 -t "$_t" "$@"; }
+
+# mkdir lock with stale detection by pid
+LOCK_HELD=""
+acquire_lock() {
+    _l="$RUN_DIR/$1.lock"; _n=0
+    while ! mkdir "$_l" 2>/dev/null; do
+        _p="$(cat "$_l/pid" 2>/dev/null)"
+        if [ -n "$_p" ] && [ ! -d "/proc/$_p" ]; then rm -rf "$_l"; continue; fi
+        _n=$((_n + 1)); [ "$_n" -gt 30 ] && return 1
+        sleep 1
+    done
+    echo $$ > "$_l/pid"
+    LOCK_HELD="$_l"
+}
+
+release_lock() { [ -n "$LOCK_HELD" ] && rm -rf "$LOCK_HELD"; LOCK_HELD=""; }
+
+lan_ready() { ip -4 addr show dev "$LAN_IF" 2>/dev/null | grep -q "inet $LAN_IP/"; }
+wg_exists() { ip -d link show "$WG_IF" 2>/dev/null | grep -q wireguard; }
+wg_up()     { ip link show "$WG_IF" 2>/dev/null | grep -q '[<,]UP[,>]'; }
+
+monitor_pid() {
+    _p="$(cat "$PIDFILE" 2>/dev/null)"
+    case "$_p" in ''|*[!0-9]*) return 1 ;; esac
+    [ -r "/proc/$_p/cmdline" ] || return 1
+    tr '\0' ' ' < "/proc/$_p/cmdline" | grep -q 'controller.*daemon' || return 1
+    echo "$_p"
+}
+
+resolve_wg() {
+    WG_BIN=""; WGQ_BIN=""
+    if [ -x "$MODDIR/bin/wg" ]; then WG_BIN="$MODDIR/bin/wg"; else WG_BIN="$(command -v wg 2>/dev/null)"; fi
+    if [ -x "$MODDIR/bin/wg-quick" ]; then WGQ_BIN="$MODDIR/bin/wg-quick"; else WGQ_BIN="$(command -v wg-quick 2>/dev/null)"; fi
+}
+
+kernel_probe() {
+    ip link add wgchk0 type wireguard >/dev/null 2>&1 || return 1
+    ip link del wgchk0 >/dev/null 2>&1
+    return 0
+}
+
+# Cache format: "<1|0>|<detail>|<epoch>"
+check_kernel() {
+    if wg_exists; then _res=1; _d="wg interface present"
+    elif kernel_probe; then _res=1; _d="link probe ok"
+    else
+        _cfg="$(zcat /proc/config.gz 2>/dev/null | grep -E '^(# )?CONFIG_WIREGUARD[= ]' | head -n 1)"
+        _res=0; _d="link probe failed (${_cfg:-config unavailable})"
+    fi
+    _d="$(printf '%s' "$_d" | tr -d '"|\\')"
+    echo "$_res|$_d|$(now)" > "$KCACHE"
+    log INFO "kernel WireGuard support=$_res ($_d) kernel=$(uname -r)"
+    [ "$_res" -eq 1 ]
+}
+
+# ---------------- cellular detection
+# The Pi is the LAN default gateway, so Android's default network is wlan0 and `route get` can
+# never identify the cellular uplink. Candidates are interfaces matching UPSTREAM_GLOBS that hold a
+# global IPv4 address; dev/src/via are then taken from ONE lookup using Android's own per-network
+# rule (`oif <if>`), which is not contaminated by our table 200.
+if_matches_upstream() {
+    for _g in $UPSTREAM_GLOBS; do
+        case "$1" in $_g) return 0 ;; esac
+    done
+    return 1
+}
+
+resolve_upstream() {   # $1 = iface, $2 = primary ipv4
+    u_if="$1"; u_ip="$2"; u_gw=""; u_src=""; u_dev=""
+    u_r="$(ip -4 route get "$TEST_IP" oif "$u_if" 2>/dev/null | head -n 1)"
+    if [ -n "$u_r" ]; then
+        set -- $u_r
+        while [ $# -gt 0 ]; do
+            case "$1" in dev) u_dev="$2" ;; via) u_gw="$2" ;; src) u_src="$2" ;; esac
+            shift
+        done
+        [ "$u_dev" = "$u_if" ] || { u_r=""; u_gw=""; u_src=""; }
+    fi
+    if [ -z "$u_r" ]; then
+        # Fallback: the interface's own default route, never one from our table.
+        u_d="$(ip -4 route show table all dev "$u_if" default 2>/dev/null | grep -Ev " table $ROUTE_TABLE( |\$)" | head -n 1)"
+        [ -n "$u_d" ] || return 1
+        set -- $u_d
+        while [ $# -gt 0 ]; do [ "$1" = via ] && u_gw="$2"; shift; done
+    fi
+    [ -n "$u_src" ] || u_src="$u_ip"
+    CELL_IF="$u_if"; CELL_IP="$u_src"; CELL_GW="$u_gw"
+    CELL_NET="$(ip -4 route show dev "$u_if" proto kernel scope link 2>/dev/null | head -n 1)"
+    CELL_NET="${CELL_NET%% *}"
+    case "$CELL_NET" in */*) ;; *) CELL_NET="" ;; esac
+    return 0
+}
+
+detect_cellular() {
+    CELL_IF=""; CELL_IP=""; CELL_GW=""; CELL_NET=""; CELL_CANDS=""
+    _lines="$(ip -4 -o addr show scope global 2>/dev/null)"
+    while read -r _i _dev _fam _addr _rest; do
+        [ "$_fam" = inet ] || continue
+        _dev="${_dev%%@*}"
+        if_matches_upstream "$_dev" || continue
+        [ -z "$UPSTREAM_IF" ] || [ "$_dev" = "$UPSTREAM_IF" ] || continue
+        CELL_CANDS="${CELL_CANDS:+$CELL_CANDS }$_dev"
+        [ -n "$CELL_IF" ] && continue
+        resolve_upstream "$_dev" "${_addr%%/*}"
+    done <<__CANDS__
+$_lines
+__CANDS__
+    case "$CELL_CANDS" in
+        *" "*) [ "$CELL_CANDS" = "$WARNED_CANDS" ] || {
+                   log WARN "multiple upstream candidates: $CELL_CANDS (using ${CELL_IF:-none}); set UPSTREAM_IF to pin one"
+                   WARNED_CANDS="$CELL_CANDS"; } ;;
+    esac
+    [ -n "$CELL_IF" ]
+}
+
+WARNED_CANDS=""
+
+# ---------------- reconcile steps: ok_<step> is a quiet check, apply_<step> mutates and logs
+# Steps that need cellular return ok when there is no upstream (nothing to do).
+
+ok_wireguard() {
+    [ -n "$WG_BIN" ] || return 1
+    wg_exists && wg_up || return 1
+    ip -4 addr show dev "$WG_IF" 2>/dev/null | grep -q "inet $WG_ADDR" || return 1
+    [ "$("$WG_BIN" show "$WG_IF" listen-port 2>/dev/null)" = "$WG_PORT" ] || return 1
+    "$WG_BIN" show "$WG_IF" allowed-ips 2>/dev/null | grep -F "$PI_PUBLIC_KEY" | grep -qF "$PI_ALLOWED_IPS"
+}
+
+apply_wireguard() {
+    [ -n "$WG_BIN" ] || { log ERROR "wg binary not found (looked in $MODDIR/bin and PATH)"; return 1; }
+    [ -r "$PRIVATE_KEY" ] || { log ERROR "private key not readable: $PRIVATE_KEY"; return 1; }
+    [ "${#PI_PUBLIC_KEY}" -eq 44 ] || { log ERROR "PI_PUBLIC_KEY($PI_PUBLIC_KEY) missing or malformed in $CONF"; return 1; }
+    case "$(stat -c %a "$PRIVATE_KEY" 2>/dev/null)" in
+        600|400) ;;
+        *) log WARN "private key permissions too open, fixing"; run chmod 600 "$PRIVATE_KEY" ;;
+    esac
+    if ip link show "$WG_IF" >/dev/null 2>&1 && ! wg_exists; then
+        log WARN "$WG_IF exists but is not a wireguard link, deleting"
+        run ip link delete "$WG_IF"
+    fi
+    if ! wg_exists; then
+        if ! kernel_probe; then
+            check_kernel
+            log ERROR "kernel has no WireGuard support"
+            return 1
+        fi
+        run ip link add "$WG_IF" type wireguard || { check_kernel; return 1; }
+    fi
+    run "$WG_BIN" set "$WG_IF" private-key "$PRIVATE_KEY" listen-port "$WG_PORT" \
+        peer "$PI_PUBLIC_KEY" allowed-ips "$PI_ALLOWED_IPS" || return 1
+    ip -4 addr show dev "$WG_IF" 2>/dev/null | grep -q "inet $WG_ADDR" || run ip addr add "$WG_ADDR" dev "$WG_IF" || return 1
+    wg_up || run ip link set "$WG_IF" up || return 1
+    check_kernel
+}
+
+
+# Latest handshake epoch of our peer (0 = never/unknown). Uses latest-handshakes, never `dump`,
+# whose first line contains the private key.
+peer_handshake_ts() {
+    [ -n "$WG_BIN" ] && [ -n "$PI_PUBLIC_KEY" ] || { echo 0; return 0; }
+    set -- $("$WG_BIN" show "$WG_IF" latest-handshakes 2>/dev/null | grep -F "$PI_PUBLIC_KEY" | head -n 1)
+    case "${2:-0}" in ''|*[!0-9]*) echo 0 ;; *) echo "$2" ;; esac
+}
+
+# Peer watchdog (daemon context: uses NOW, LAN, WG).
+# Failure mode: the Pi has no RTC, so after a power cycle its clock can be BEHIND the TAI64N timestamp
+# WireGuard stored for it. The phone then silently drops every handshake as a replay, and the Pi cannot
+# fix its clock because its internet comes through this very tunnel. Rebuilding the peer clears the
+# stored timestamp. It only acts while the Pi answers on the LAN and no handshake has arrived for
+# PEER_RESET_AFTER seconds, escalating once per Pi return: 1 = remove/re-add peer, 2 = recreate wg0.
+peer_watchdog() {
+    [ "$PEER_WATCHDOG" = 1 ] || return 0
+    [ "$NOW" -ge "$PW_NEXT" ] || return 0
+    PW_NEXT=$((NOW + PEER_CHECK_EVERY))
+
+    if [ "$LAN" != 1 ]; then PW_BAD_SINCE=0; PW_STAGE=0; return 0; fi     # Pi is away: start over on return
+    [ "$WG" = 1 ] && [ -n "$WG_BIN" ] && [ "${#PI_PUBLIC_KEY}" -eq 44 ] || return 0
+
+    _hs="$(peer_handshake_ts)"
+    if [ "$_hs" -gt 0 ] && [ $((NOW - _hs)) -le "$HANDSHAKE_TIMEOUT" ]; then
+        [ "$PW_STAGE" -gt 0 ] && log INFO "peer watchdog: handshake restored after stage $PW_STAGE (1=peer reset, 2=wg0 recreate)"
+        PW_BAD_SINCE=0; PW_STAGE=0
+        [ "$PW_CONN" = 1 ] || { PW_CONN=1; update_module_description; }
+        return 0
+    fi
+    [ "$PW_CONN" = 0 ] || { PW_CONN=0; update_module_description; }
+
+    if ! ping -c 1 -W 1 "$PI_IP" >/dev/null 2>&1; then PW_BAD_SINCE=0; PW_STAGE=0; return 0; fi
+    if [ "$PW_BAD_SINCE" -eq 0 ]; then
+        PW_BAD_SINCE="$NOW"
+        log INFO "peer watchdog: $PI_IP answers but no recent handshake (last: ${_hs:-0}), waiting ${PEER_RESET_AFTER}s"
+        return 0
+    fi
+    [ $((NOW - PW_BAD_SINCE)) -ge "$PEER_RESET_AFTER" ] || return 0
+
+    acquire_lock net || return 0
+    case "$PW_STAGE" in
+        0)  log WARN "peer watchdog: no handshake for ${PEER_RESET_AFTER}s, resetting peer"
+            run "$WG_BIN" set "$WG_IF" peer "$PI_PUBLIC_KEY" remove
+            run "$WG_BIN" set "$WG_IF" peer "$PI_PUBLIC_KEY" allowed-ips "$PI_ALLOWED_IPS"
+            PW_STAGE=1; PW_BAD_SINCE="$NOW" ;;
+        1)  log WARN "peer watchdog: still no handshake after peer reset, recreating $WG_IF"
+            run ip link delete "$WG_IF"
+            PW_STAGE=2; PW_BAD_SINCE="$NOW" ;;
+        2)  log WARN "peer watchdog: still no handshake after recreating $WG_IF; likely Pi-side (clock, config, service). Not acting again until the Pi leaves and returns"
+            PW_STAGE=3 ;;
+    esac
+    release_lock
+}
+
+ok_forward() { [ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" = "1" ]; }
+
+apply_forward() {
+    if echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null; then log INFO "ok: ip_forward=1"
+    else log ERROR "failed to enable IPv4 forwarding"; return 1; fi
+}
+
+ok_lan() {
+    lan_ready || return 0
+    ip -4 route show table main 2>/dev/null | grep -q "^$PI_IP dev $LAN_IF"
+}
+
+apply_lan() { run ip route replace "$PI_IP" dev "$LAN_IF" src "$LAN_IP" table main; }
+
+rule_ok() { ip -4 rule show 2>/dev/null | grep -q "^$1:.*$2"; }
+
+ok_rules() {
+    rule_ok "$LAN_RULE_PREF" "to $LAN_NET lookup main" &&
+    rule_ok "$WG_RULE_PREF" "to $WG_NET lookup main" &&
+    rule_ok "$ROUTE_PREF" "from $WG_NET lookup $ROUTE_TABLE"
+}
+
+apply_rules() {
+    _rc=0
+    rule_ok "$LAN_RULE_PREF" "to $LAN_NET lookup main" || run ip rule add pref "$LAN_RULE_PREF" to "$LAN_NET" lookup main || _rc=1
+    rule_ok "$WG_RULE_PREF" "to $WG_NET lookup main" || run ip rule add pref "$WG_RULE_PREF" to "$WG_NET" lookup main || _rc=1
+    rule_ok "$ROUTE_PREF" "from $WG_NET lookup $ROUTE_TABLE" || run ip rule add pref "$ROUTE_PREF" from "$WG_NET" lookup "$ROUTE_TABLE" || _rc=1
+    return "$_rc"
+}
+
+ok_upstream() {
+    [ -n "$CELL_IF" ] || return 0
+    _d="$(ip -4 route show table "$ROUTE_TABLE" default 2>/dev/null)"
+    case "$_d" in *" dev $CELL_IF"*) ;; *) return 1 ;; esac
+    if [ -n "$CELL_GW" ]; then
+        case "$_d" in *" via $CELL_GW "*|*" via $CELL_GW") ;; *) return 1 ;; esac
+    fi
+    if [ -n "$CELL_NET$CELL_GW" ]; then
+        ip -4 route show table "$ROUTE_TABLE" 2>/dev/null | grep -q " src $CELL_IP" || return 1
+    fi
+    return 0
+}
+
+apply_upstream() {
+    _rc=0
+    [ -z "$(ip -4 route show table "$ROUTE_TABLE" 2>/dev/null)" ] || run ip route flush table "$ROUTE_TABLE"
+    if [ -n "$CELL_NET" ]; then
+        run ip route replace "$CELL_NET" dev "$CELL_IF" src "$CELL_IP" table "$ROUTE_TABLE" || _rc=1
+    elif [ -n "$CELL_GW" ]; then
+        run ip route replace "$CELL_GW" dev "$CELL_IF" src "$CELL_IP" table "$ROUTE_TABLE" || _rc=1
+    fi
+    if [ -n "$CELL_GW" ]; then
+        run ip route replace default via "$CELL_GW" dev "$CELL_IF" table "$ROUTE_TABLE" || _rc=1
+    else
+        run ip route replace default dev "$CELL_IF" table "$ROUTE_TABLE" || _rc=1
+    fi
+    return "$_rc"
+}
+
+fwd_parent() { if ipx filter -S tetherctrl_FORWARD; then echo tetherctrl_FORWARD; else echo FORWARD; fi; }
+
+# unlink_chain <table> <chain> <parent...>: remove every jump to <chain>
+unlink_chain() {
+    _tb="$1"; _ch="$2"; shift 2
+    for _par in "$@"; do
+        _n=0
+        while ipx "$_tb" -C "$_par" -j "$_ch" && [ "$_n" -lt 10 ]; do
+            ipr "$_tb" -D "$_par" -j "$_ch" || break
+            _n=$((_n + 1))
+        done
+    done
+}
+
+ok_fwd() {
+    [ -n "$CELL_IF" ] || return 0
+    _p="$(fwd_parent)"
+    ipx filter -C "$FORWARD_CHAIN" -i "$WG_IF" -o "$CELL_IF" -j ACCEPT &&
+    ipx filter -C "$FORWARD_CHAIN" -i "$CELL_IF" -o "$WG_IF" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT &&
+    ipx filter -C "$_p" -j "$FORWARD_CHAIN"
+}
+
+apply_fwd() {
+    _p="$(fwd_parent)"
+    ipx filter -N "$FORWARD_CHAIN"
+    unlink_chain filter "$FORWARD_CHAIN" tetherctrl_FORWARD FORWARD
+    ipr filter -F "$FORWARD_CHAIN" || return 1
+    ipr filter -A "$FORWARD_CHAIN" -i "$WG_IF" -o "$CELL_IF" -j ACCEPT || return 1
+    ipr filter -A "$FORWARD_CHAIN" -i "$CELL_IF" -o "$WG_IF" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT || return 1
+    ipr filter -I "$_p" 1 -j "$FORWARD_CHAIN"
+}
+
+ok_nat() {
+    [ -n "$CELL_IF" ] || return 0
+    ipx nat -C "$NAT_CHAIN" -s "$WG_NET" -o "$CELL_IF" -j MASQUERADE &&
+    ipx nat -C POSTROUTING -j "$NAT_CHAIN"
+}
+
+apply_nat() {
+    ipx nat -N "$NAT_CHAIN"
+    unlink_chain nat "$NAT_CHAIN" POSTROUTING
+    ipr nat -F "$NAT_CHAIN" || return 1
+    ipr nat -A "$NAT_CHAIN" -s "$WG_NET" -o "$CELL_IF" -j MASQUERADE || return 1
+    ipr nat -I POSTROUTING 1 -j "$NAT_CHAIN"
+}
+
+write_state() {
+    {
+        echo "status=$1"
+        echo "cell_if=$CELL_IF"
+        echo "timestamp=$(date '+%Y-%m-%d %H:%M:%S')"
+    } > "$STATEFILE"
+}
+
+# Runs every step even if an earlier one fails (the steps are independent).
+do_reconcile() {
+    acquire_lock net || { log ERROR "reconcile: could not acquire lock"; return 2; }
+    resolve_wg
+    detect_cellular
+    if [ -n "$CELL_IF" ]; then log INFO "upstream: $CELL_IF $CELL_IP via ${CELL_GW:-direct}"
+    else log WARN "no cellular upstream (candidates: ${CELL_CANDS:-none})"; fi
+    _fail=0; _rep=0
+    for _s in $STEPS; do
+        if "ok_$_s"; then
+            log DEBUG "step $_s: ok"
+        else
+            log INFO "step $_s: drift, applying"
+            if "apply_$_s" && "ok_$_s"; then log INFO "step $_s: repaired"; _rep=$((_rep + 1))
+            else log ERROR "step $_s: failed"; _fail=$((_fail + 1)); fi
+        fi
+    done
+    if [ "$_fail" -ne 0 ]; then _st=DEGRADED
+    elif [ -z "$CELL_IF" ]; then _st=OFFLINE
+    else _st=HEALTHY; fi
+    write_state "$_st"
+    update_module_description
+    log INFO "reconcile: $_st (repaired=$_rep failed=$_fail)"
+    release_lock
+    return "$_fail"
+}
+
+# Silent drift check: prints the first drifted step.
+reconcile_check() {
+    for _s in $STEPS; do "ok_$_s" || { echo "$_s"; return 1; }; done
+    return 0
+}
+
+do_teardown() {
+    log INFO "teardown: begin"
+    unlink_chain filter "$FORWARD_CHAIN" tetherctrl_FORWARD FORWARD
+    if ipx filter -S "$FORWARD_CHAIN"; then ipr filter -F "$FORWARD_CHAIN"; ipr filter -X "$FORWARD_CHAIN"; fi
+    unlink_chain nat "$NAT_CHAIN" POSTROUTING
+    if ipx nat -S "$NAT_CHAIN"; then ipr nat -F "$NAT_CHAIN"; ipr nat -X "$NAT_CHAIN"; fi
+    for _pref in "$LAN_RULE_PREF" "$WG_RULE_PREF" "$ROUTE_PREF"; do
+        _n=0
+        while ip -4 rule show 2>/dev/null | grep -q "^$_pref:" && [ "$_n" -lt 5 ]; do
+            run ip rule del pref "$_pref" || break
+            _n=$((_n + 1))
+        done
+    done
+    [ -z "$(ip -4 route show table "$ROUTE_TABLE" 2>/dev/null)" ] || run ip route flush table "$ROUTE_TABLE"
+    ip -4 route show table main 2>/dev/null | grep -q "^$PI_IP dev $LAN_IF" && run ip route del "$PI_IP" dev "$LAN_IF" table main
+    if wg_exists; then run ip link delete "$WG_IF"; fi
+    log INFO "teardown: done"
+}
+
+locked_teardown() {
+    acquire_lock net || { log ERROR "teardown: could not acquire lock"; return 1; }
+    do_teardown
+    release_lock
+}
+
+# ---------------- status (collect once, print as text or JSON)
+js() { printf '%s' "$1" | tr -d '"\\\n\r'; }
+jb() { if [ "$1" = 1 ]; then echo true; else echo false; fi; }
+
+collect_status() {
+    S_NOW="$(now)"
+    resolve_wg; detect_cellular
+    DEF_IF=""
+    set -- $(ip -4 route get "$TEST_IP" 2>/dev/null | head -n 1)
+    while [ $# -gt 0 ]; do [ "$1" = dev ] && DEF_IF="$2"; shift; done
+
+    if wg_exists; then S_K=1; S_KD="wg interface active"
+    else
+        [ -f "$KCACHE" ] || check_kernel >/dev/null 2>&1
+        _c="$(cat "$KCACHE" 2>/dev/null)"
+        S_K="${_c%%|*}"; _c="${_c#*|}"; S_KD="${_c%|*}"
+    fi
+    [ "$S_K" = 1 ] || S_K=0
+
+    S_EX=0; S_UP=0; S_ADDR=""
+    if wg_exists; then
+        S_EX=1; wg_up && S_UP=1
+        set -- $(ip -4 -o addr show dev "$WG_IF" 2>/dev/null | head -n 1)
+        S_ADDR="$4"
+    fi
+
+    S_CONN=0; S_HSAGE=null; S_RX=0; S_TX=0; S_EP=""
+    if [ "$S_EX" = 1 ] && [ -n "$WG_BIN" ]; then
+        # One call. Peer line: pubkey psk endpoint allowed-ips handshake rx tx keepalive.
+        # The dump's first line holds the private key, so only the line of our peer is ever used.
+        if [ -n "$PI_PUBLIC_KEY" ]; then
+            set -- $("$WG_BIN" show "$WG_IF" dump 2>/dev/null | grep -F "$PI_PUBLIC_KEY" | head -n 1)
+            S_EP="${3:-}"; _ts="${5:-0}"; S_RX="${6:-0}"; S_TX="${7:-0}"
+            case "$_ts" in ''|*[!0-9]*) _ts=0 ;; esac
+            case "$S_RX" in ''|*[!0-9]*) S_RX=0 ;; esac
+            case "$S_TX" in ''|*[!0-9]*) S_TX=0 ;; esac
+            if [ "$_ts" -gt 0 ]; then
+                S_HSAGE=$((S_NOW - _ts))
+                [ "$S_HSAGE" -le "$HANDSHAKE_TIMEOUT" ] && S_CONN=1
+            fi
+        fi
+    fi
+
+    S_ON=0; [ -n "$CELL_IF" ] && S_ON=1
+    S_MP="$(monitor_pid)"; S_MR=0; [ -n "$S_MP" ] && S_MR=1
+    S_HB=null
+    _h="$(cat "$HEARTBEAT" 2>/dev/null)"
+    case "$_h" in ''|*[!0-9]*) ;; *) S_HB=$((S_NOW - _h)) ;; esac
+    S_REC="$(sed -n 's/^status=//p' "$STATEFILE" 2>/dev/null)"
+    S_RECT="$(sed -n 's/^timestamp=//p' "$STATEFILE" 2>/dev/null)"
+    S_WGIN=0; case "$WG_BIN" in "$MODDIR"/bin/*) S_WGIN=1 ;; esac
+    S_WQIN=0; case "$WGQ_BIN" in "$MODDIR"/bin/*) S_WQIN=1 ;; esac
+    S_WGOK=0; [ -n "$WG_BIN" ] && "$WG_BIN" --version >/dev/null 2>&1 && S_WGOK=1
+    S_WQOK=0; [ -n "$WGQ_BIN" ] && [ -x "$WGQ_BIN" ] && S_WQOK=1
+
+}
+
+status_json() {
+    collect_status
+    cat <<__JSON__
+{"version":"$VERSION","time":$S_NOW,
+"kernel":{"supported":$(jb "$S_K"),"detail":"$(js "$S_KD")","release":"$(js "$(uname -r)")"},
+"iface":{"name":"$(js "$WG_IF")","exists":$(jb "$S_EX"),"up":$(jb "$S_UP"),"addr":"$(js "$S_ADDR")"},
+"wg":{"connected":$(jb "$S_CONN"),"handshake_age":$S_HSAGE,"timeout":$HANDSHAKE_TIMEOUT,"rx":${S_RX:-0},"tx":${S_TX:-0},"endpoint":"$(js "$S_EP")"},
+"upstream":{"online":$(jb "$S_ON"),"iface":"$(js "$CELL_IF")","ip":"$(js "$CELL_IP")","gw":"$(js "$CELL_GW")","candidates":"$(js "$CELL_CANDS")","default_if":"$(js "$DEF_IF")"},
+"monitor":{"running":$(jb "$S_MR"),"pid":${S_MP:-null},"heartbeat_age":$S_HB,"interval":$RECONCILE_INTERVAL,"reconcile":"$(js "$S_REC")","reconcile_time":"$(js "$S_RECT")"},
+"files":{"wg":"$(js "$WG_BIN")","wg_in_module":$(jb "$S_WGIN"),"wg_ok":$(jb "$S_WGOK"),"wg_quick":"$(js "$WGQ_BIN")","wg_quick_in_module":$(jb "$S_WQIN"),"wg_quick_ok":$(jb "$S_WQOK")}}
+__JSON__
+}
+
+status_text() {
+    collect_status
+    echo "WWAN-WG v$VERSION"
+    echo "kernel_wireguard=$S_K ($S_KD)"
+    echo "wg_exists=$S_EX wg_up=$S_UP addr=$S_ADDR"
+    echo "wg_connected=$S_CONN handshake_age=$S_HSAGE rx=$S_RX tx=$S_TX"
+    echo "upstream=${CELL_IF:-OFFLINE} ip=$CELL_IP gw=$CELL_GW (default network: ${DEF_IF:-none}; candidates: ${CELL_CANDS:-none})"
+    echo "daemon_running=$S_MR pid=${S_MP:-none} heartbeat_age=$S_HB"
+    echo "reconcile=${S_REC:-UNKNOWN} at ${S_RECT:-never}"
+    echo "wg=${WG_BIN:-missing} usable=$S_WGOK (module bin: $S_WGIN) wg-quick=${WGQ_BIN:-missing} usable=$S_WQOK (module bin: $S_WQIN)"
+}
+
+# The description is written with printf from a temp file. The previous `sed "s/^description=.*/.../"`
+# broke on the "/" in "UP/OK" (it is sed's delimiter), so the file never changed.
+update_module_description() {
+    _mp="$MODDIR/module.prop"
+    [ -f "$_mp" ] || { log WARN "module.prop not found: $_mp"; return 0; }
+
+    if ! wg_exists; then _wg="🔴MISSING"
+    elif ! wg_up; then _wg="🔴DOWN"
+    else
+        _hs="$(peer_handshake_ts)"
+        if [ "$_hs" -gt 0 ] && [ $(( $(now) - _hs )) -le "$HANDSHAKE_TIMEOUT" ]; then _wg="🟢UP/OK"; else _wg="🟡UP/NO-HS"; fi
+    fi
+    _daemon="$(monitor_pid)" 
+    [ -n "$_daemon" ] && _daemon="⚙️$_daemon" || _daemon="⛔--"
+    _reconcile="$(sed -n 's/^status=//p' "$STATEFILE" 2>/dev/null)"; _reconcile="${_reconcile:-UNKNOWN}"
+    _k=1
+    if [ "$_wg" = MISSING ]; then _c="$(cat "$KCACHE" 2>/dev/null)"; [ "${_c%%|*}" = 0 ] && _k=0; fi
+
+    if [ "$_k" = 1 ]; then _desc="WG:$_wg | D:$_daemon | R:$_reconcile"
+    else _desc="K:🚫UNSUPPORTED | WG:$_wg | D:$_daemon | R:$_reconcile"; fi
+
+    _old="$(sed -n 's/^description=//p' "$_mp" 2>/dev/null)"
+    [ "$_old" = "$_desc" ] && return 0
+
+    _tmp="$_mp.tmp"; _seen=0
+    if grep -q '^description=' "$_mp" 2>/dev/null; then
+        awk -v desc="$_desc" '
+            /^description=/ {
+                print "description=" desc
+                next
+            }
+            { print }    ' "$_mp" > "$_tmp" &&
+            mv -f "$_tmp" "$_mp" || { rm -f "$_tmp"; log WARN "module.prop: could not replace file"; return 0; }
+    else
+        printf 'description=%s\n' "$_desc" >> "$_mp"
+    fi
+
+    if [ "$(sed -n 's/^description=//p' "$_mp" 2>/dev/null)" = "$_desc" ]; then
+        log INFO "module.prop description updated: $_desc"
+    else
+        log WARN "module.prop description update did not stick"
+    fi
+}
+
+
+# On-demand active test (not run periodically: it costs cellular data).
+cmd_health() {
+    resolve_wg; detect_cellular
+    [ -n "$CELL_IF" ] || { echo "cellular=OFFLINE"; return 1; }
+    echo "cellular=$CELL_IF"
+    _e="$(ip -4 route get "$TEST_IP" from "$WG_IP" 2>/dev/null | head -n 1)"
+    case "$_e" in
+        *"dev $CELL_IF"*) echo "wg_source_route=ok" ;;
+        *) echo "wg_source_route=FAIL ($_e)"; return 1 ;;
+    esac
+    if ping -c 1 -W 3 -I "$WG_IP" "$TEST_IP" >/dev/null 2>&1; then echo "ping=ok"
+    else echo "ping=FAIL"; return 1; fi
+}
+
+# ---------------- lifecycle
+cmd_daemon() {
+    TAG="daemon"
+    if _p="$(monitor_pid)" && [ "$_p" != "$$" ]; then log WARN "already running (pid $_p)"; exit 0; fi
+    echo $$ > "$PIDFILE"
+    cleanup() {
+        [ "$(cat "$PIDFILE" 2>/dev/null)" = "$$" ] && rm -f "$PIDFILE"
+        release_lock
+        log INFO "daemon stopped"
+    }
+    trap cleanup EXIT
+    trap 'exit 0' INT TERM HUP         # the handler must exit, otherwise the loop would keep running
+
+    log INFO "daemon v$VERSION started pid=$$ interval=${RECONCILE_INTERVAL}s health=${HEALTH_INTERVAL}s"
+    log INFO "config: wg=$WG_IF lan=$LAN_IF($LAN_IP) peer=$PI_IP upstream_globs='$UPSTREAM_GLOBS' pin='${UPSTREAM_IF:-none}'"
+    resolve_wg
+    log INFO "binaries: wg=${WG_BIN:-missing} wg-quick=${WGQ_BIN:-missing}"
+    check_kernel
+
+    LAST_SIG=""; NEXT_CHECK=0; LAST_LAN_WARN=""
+    PW_NEXT=0; PW_BAD_SINCE=0; PW_STAGE=0; PW_CONN=""
+    while :; do
+        if [ -f "$MODDIR/disable" ] || [ -f "$MODDIR/remove" ]; then
+            log WARN "module disabled or removed: tearing down and exiting"
+            locked_teardown
+            exit 0
+        fi
+        NOW="$(now)"; echo "$NOW" > "$HEARTBEAT"
+        detect_cellular
+        lan_ready && LAN=1 || LAN=0
+        wg_exists && WG=1 || WG=0
+        if [ "$LAN" = 0 ]; then
+            set -- $(ip -4 -o addr show dev "$LAN_IF" 2>/dev/null | head -n 1)
+            _cur="${4%%/*}"
+            if [ -n "$_cur" ] && [ "$_cur" != "$LAST_LAN_WARN" ]; then
+                log WARN "$LAN_IF has $_cur but LAN_IP is $LAN_IP: LAN route skipped, update LAN_IP in $CONF"
+                LAST_LAN_WARN="$_cur"
+            fi
+        fi
+        SIG="wg=$WG lan=$LAN up=${CELL_IF:-none}|${CELL_IP:--}|${CELL_GW:--}"
+
+        if [ "$SIG" != "$LAST_SIG" ]; then
+            log INFO "state: ${LAST_SIG:-init} -> $SIG"
+            LAST_SIG="$SIG"
+            if do_reconcile; then NEXT_CHECK=$((NOW + HEALTH_INTERVAL))
+            else NEXT_CHECK=$((NOW + 4 * HEALTH_INTERVAL)); fi     # back off after a failed repair
+        elif [ "$NOW" -ge "$NEXT_CHECK" ]; then
+            log_rotate
+            if _d="$(reconcile_check)"; then
+                NEXT_CHECK=$((NOW + HEALTH_INTERVAL))
+                update_module_description
+            else
+                log WARN "drift detected in step '$_d', reconciling"
+                if do_reconcile; then NEXT_CHECK=$((NOW + HEALTH_INTERVAL))
+                else NEXT_CHECK=$((NOW + 4 * HEALTH_INTERVAL)); fi
+            fi
+        fi
+        peer_watchdog
+        sleep "$RECONCILE_INTERVAL" & wait $!
+    done
+}
+
+cmd_start() {
+    if [ -f "$MODDIR/disable" ]; then echo "module is disabled"; return 1; fi
+    if _p="$(monitor_pid)"; then echo "already running (pid $_p)"; return 0; fi
+    log INFO "start requested"
+    if command -v setsid >/dev/null 2>&1; then
+        setsid "$SH" "$SELF" daemon </dev/null >/dev/null 2>&1 &
+    else
+        nohup "$SH" "$SELF" daemon </dev/null >/dev/null 2>&1 &
+    fi
+    sleep 1
+    if _p="$(monitor_pid)"; then echo "started (pid $_p)"; else echo "failed to start, see logs"; return 1; fi
+}
+
+# Stops only the daemon; routes, rules, chains and wg0 stay in place.
+stop_daemon() {
+    _p="$(monitor_pid)"
+    if [ -n "$_p" ]; then
+        kill "$_p" 2>/dev/null
+        _n=0
+        while [ -d "/proc/$_p" ] && [ "$_n" -lt 10 ]; do sleep 1; _n=$((_n + 1)); done
+        [ -d "/proc/$_p" ] && { log WARN "daemon ignored SIGTERM, sending SIGKILL"; kill -9 "$_p" 2>/dev/null; }
+    fi
+    rm -f "$PIDFILE" "$HEARTBEAT"
+}
+
+# stop = daemon + full teardown (wg0, rules, routes, chains).
+cmd_stop() {
+    log INFO "stop requested (full teardown)"
+    stop_daemon
+    resolve_wg
+    locked_teardown
+    echo "stopped"
+}
+
+# restart = daemon only; the new daemon adopts the existing state.
+cmd_restart() {
+    log INFO "restart requested (daemon only, existing state is kept)"
+    stop_daemon
+    cmd_start
+}
+
+cmd_logs() {
+    _n="${1:-100}"
+    case "$_n" in ''|*[!0-9]*) _n=100 ;; esac
+    tail -n "$_n" "$LOG" 2>/dev/null
+}
+
+usage() { echo "Usage: $0 {start|stop|restart|daemon|reconcile|status [--json]|health|logs [n]|check-kernel|clear-log|teardown}"; }
+
+case "${1:-help}" in
+    daemon)       cmd_daemon ;;
+    start)        cmd_start ;;
+    stop)         cmd_stop ;;
+    restart)      cmd_restart ;;
+    reconcile)    log_rotate; log INFO "manual reconcile"; do_reconcile; _rc=$?; status_text; exit "$_rc" ;;
+    status)       if [ "${2:-}" = "--json" ]; then status_json; else status_text; fi ;;
+    health)       cmd_health ;;
+    logs)         cmd_logs "${2:-}" ;;
+    check-kernel) check_kernel; _rc=$?; cat "$KCACHE"; exit "$_rc" ;;
+    clear-log)    : > "$LOG"; log INFO "log cleared" ;;
+    teardown)     resolve_wg; locked_teardown ;;
+    *)            usage; exit 2 ;;
+esac

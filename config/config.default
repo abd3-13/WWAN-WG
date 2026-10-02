@@ -1,0 +1,39 @@
+# WWAN-WG configuration (POSIX sh, sourced by the controller).
+# Live copy: /data/adb/wwan-wg/config.conf (survives module updates).
+# After editing: WebUI -> Restart.
+
+WG_IF="wg0"
+WG_ADDR="10.200.0.1/24"
+WG_NET="10.200.0.0/24"
+WG_PORT="51820"
+PRIVATE_KEY="/data/local/wireguard/phone_private.key"
+PI_PUBLIC_KEY="PUBLIC-key-of-wireguard"
+PI_ALLOWED_IPS="10.200.0.2/32"
+
+LAN_IF="wlan0"
+LAN_IP="10.4.2.2"
+PI_IP="10.4.2.1"
+LAN_NET="10.4.2.0/24"
+
+ROUTE_TABLE="200"
+ROUTE_PREF="100"
+LAN_RULE_PREF="50"
+WG_RULE_PREF="51"
+TEST_IP="1.1.1.1"
+FORWARD_CHAIN="WWAN_WG_FORWARD"
+NAT_CHAIN="WWAN_WG_NAT"
+
+# Cellular upstream selection. Candidates = interfaces matching these globs that
+# hold a global IPv4 address. Set UPSTREAM_IF to pin one when several qualify.
+UPSTREAM_GLOBS="rmnet_data* v4-rmnet_data* ccmni* v4-ccmni*"
+UPSTREAM_IF=""
+
+RECONCILE_INTERVAL="5"      # seconds between polls
+HEALTH_INTERVAL="30"        # seconds between silent drift checks
+HANDSHAKE_TIMEOUT="180"     # peer is "connected" if the handshake is newer than this
+LOG_LEVEL="info"            # info | debug
+LOG_MAX_KB="512"            # rotate above this size, keeps .1 .2 .3
+
+PEER_WATCHDOG="1"
+PEER_RESET_AFTER="90"
+PEER_CHECK_EVERY="10"

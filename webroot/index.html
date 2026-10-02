@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>WWAN-WG</title>
+<style>
+:root{color-scheme:light dark;--bg:#f2f0ec;--panel:#fff;--ink:#1c2026;--mute:#6a717d;--line:#dedbd5;
+--ok:#1d8c5c;--warn:#b27418;--err:#c0354a;--off:#9aa0aa;--logbg:#15191e;--logink:#c9d1da}
+@media(prefers-color-scheme:dark){:root{--bg:#0f1215;--panel:#161a1f;--ink:#e3e7ed;--mute:#8b94a1;--line:#252b33;
+--ok:#45c08a;--warn:#dfa43a;--err:#ee697c;--off:#59616d;--logbg:#0a0c0f}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif;
+padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)}
+main{max-width:760px;margin:0 auto;padding:16px 14px 28px}
+header{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:12px}
+h1{font-size:21px;margin:0;font-weight:650}
+#overall{font-size:14px;font-weight:600}
+#overall.ok{color:var(--ok)}#overall.err{color:var(--err)}#overall.warn{color:var(--warn)}
+#banner{display:none;margin:0 0 12px;padding:10px 12px;border:1px solid var(--err);border-radius:6px;color:var(--err);font-size:14px}
+.list{background:var(--panel);border:1px solid var(--line);border-radius:8px}
+.row{display:flex;gap:12px;padding:12px 14px;border-top:1px solid var(--line)}
+.row:first-child{border-top:0}
+.row i{flex:none;width:10px;height:10px;margin-top:6px;border-radius:50%;background:var(--off)}
+.row.ok i{background:var(--ok)}.row.warn i{background:var(--warn)}.row.err i{background:var(--err)}
+.t{min-width:0;display:flex;flex-direction:column}
+.t b{font-weight:600}
+.t span{overflow-wrap:anywhere}
+.t small{color:var(--mute);overflow-wrap:anywhere}
+.files small{white-space:pre-line}
+.files .t span{display:block}
+.bar{display:flex;flex-wrap:wrap;gap:8px;margin:14px 0 8px}
+button{font:inherit;font-size:14px;padding:7px 12px;border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--ink)}
+button:active{background:var(--line)}
+button:focus-visible{outline:2px solid var(--ok);outline-offset:2px}
+button:disabled{opacity:.5}
+h2{font-size:15px;margin:18px 0 6px;font-weight:600}
+#log{margin:0;height:320px;overflow:auto;padding:10px 12px;border-radius:8px;background:var(--logbg);color:var(--logink);
+font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;word-break:break-all}
+.WARN{color:#e5b04a}.ERROR{color:#f07a8c}.DEBUG{color:#7d8794}
+#foot{margin-top:6px;color:var(--mute);font-size:12px}
+</style>
+</head>
+<body>
+<main>
+<header><h1>WWAN-WG</h1><span id="overall"></span></header>
+<div id="banner"></div>
+<div class="list" id="rows"></div>
+<div class="bar">
+  <button data-act="restart" id="b-restart">Restart</button>
+  <button data-act="reconcile">Reconcile now</button>
+  <button data-act="check-kernel">Recheck kernel</button>
+  <button data-act="clear-log">Clear log</button>
+  <button data-act="stop" id="b-stop">Stop</button>
+</div>
+<h2>Log</h2>
+<pre id="log"></pre>
+<div id="foot"></div>
+</main>
+<script>
+const CTL='/system/bin/sh /data/adb/modules/wwan-wg/bin/controller';
+const $=s=>document.querySelector(s);
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+function sh(cmd){
+  return new Promise(res=>{
+    if(typeof ksu==='undefined') return res({errno:-1,stdout:'',stderr:'Open this page from the KernelSU manager (ksu API not found).'});
+    const cb='_c'+Date.now()+Math.random().toString(36).slice(2);
+    window[cb]=(errno,stdout,stderr)=>{delete window[cb];res({errno,stdout,stderr});};
+    try{ksu.exec(cmd,'{}',cb);}catch(e){delete window[cb];res({errno:-1,stdout:'',stderr:String(e)});}
+  });
+}
+const bytes=n=>{n=+n||0;const u=['B','KiB','MiB','GiB'];let i=0;while(n>=1024&&i<3){n/=1024;i++;}return (i?n.toFixed(1):n)+' '+u[i];};
+const age=s=>s==null?'never':s<60?s+'s':s<3600?Math.floor(s/60)+'m '+s%60+'s':Math.floor(s/3600)+'h '+Math.floor(s%3600/60)+'m';
+const row=(st,label,main,sub,cls)=>`<div class="row ${st} ${cls||''}"><i></i><div class="t"><b>${esc(label)}</b><span>${esc(main)}</span>${sub?`<small>${esc(sub)}</small>`:''}</div></div>`;
+
+function render(s){
+  const k=s.kernel,f=s.iface,w=s.wg,u=s.upstream,m=s.monitor,fl=s.files;
+  const rows=[];
+  rows.push(row(k.supported?'ok':'err','Kernel WireGuard support',k.supported?'Supported':'Not supported',k.detail+' · kernel '+k.release));
+  rows.push(row(!f.exists?'err':f.up?'ok':'warn','Interface '+f.name,!f.exists?'Missing':f.up?'Up':'Present but down',f.addr));
+  rows.push(row(!f.exists?'off':w.connected?'ok':'warn','Peer connection',
+    !f.exists?'No interface':w.connected?'Connected':'No recent handshake',
+    'Last handshake: '+(w.handshake_age==null?'never':age(w.handshake_age)+' ago')+' · rx '+bytes(w.rx)+' · tx '+bytes(w.tx)+(w.endpoint&&w.endpoint!=='(none)'?' · '+w.endpoint:'')));
+  rows.push(row(u.online?'ok':'err','Cellular upstream',u.online?u.iface:'Offline',
+    (u.online?u.ip+(u.gw?' via '+u.gw:' (point-to-point)')+' · ':'')+'default network: '+(u.default_if||'none')+(u.candidates.includes(' ')?' · candidates: '+u.candidates:'')));
+  const stale=m.running&&m.heartbeat_age!=null&&m.heartbeat_age>m.interval*3+3;
+  rows.push(row(!m.running?'err':stale?'warn':'ok','Monitor',!m.running?'Stopped':stale?'Running, heartbeat stale':'Running',
+    (m.running?'pid '+m.pid+' · heartbeat '+age(m.heartbeat_age)+' ago · ':'')+'last reconcile: '+(m.reconcile||'unknown')+(m.reconcile_time?' at '+m.reconcile_time:'')));
+  const binOk=fl.wg_ok&&fl.wg_quick_ok;
+  const where=(p,inMod)=>p?(inMod?'module bin/':'system PATH')+': '+p:'not found';
+  rows.push(row(binOk?'ok':'err','wg and wg-quick',
+    binOk?'Both available':!fl.wg&&!fl.wg_quick?'Both missing':!fl.wg_ok?'wg '+(fl.wg?'not usable':'missing'):'wg-quick '+(fl.wg_quick?'not executable':'missing'),
+    'wg '+where(fl.wg,fl.wg_in_module)+'\nwg-quick '+where(fl.wg_quick,fl.wg_quick_in_module),'files'));
+  $('#rows').innerHTML=rows.join('');
+  const bad=!k.supported||!f.exists||!u.online||!m.running||!binOk;
+  const o=$('#overall');
+  o.className=bad?'err':(f.up&&w.connected)?'ok':'warn';
+  o.textContent=bad?'Needs attention':(f.up&&w.connected)?'Running':'Waiting for peer';
+  $('#b-restart').textContent=m.running?'Restart':'Start';
+  $('#foot').textContent='v'+s.version+' · updated '+new Date(s.time*1000).toLocaleTimeString();
+}
+
+let logFirst=true;
+function renderLog(t){
+  const el=$('#log'),stick=logFirst||el.scrollHeight-el.scrollTop-el.clientHeight<40;
+  logFirst=false;
+  el.innerHTML=t.split('\n').map(l=>{const m=l.match(/\[(INFO|WARN|ERROR|DEBUG)\]/);return m?`<span class="${m[1]}">${esc(l)}</span>`:esc(l);}).join('\n');
+  if(stick)el.scrollTop=el.scrollHeight;
+}
+
+let busy=false;
+async function refresh(){
+  if(busy||document.hidden)return;
+  busy=true;
+  try{
+    const [st,lg]=await Promise.all([sh(CTL+' status --json'),sh(CTL+' logs 300')]);
+    let s=null;try{s=JSON.parse(st.stdout);}catch(e){}
+    const b=$('#banner');
+    if(!s){b.style.display='block';b.textContent='Cannot read status. '+(st.stderr||('exit '+st.errno))+' '+st.stdout.slice(0,200);}
+    else{b.style.display='none';render(s);}
+    if(lg.errno===0)renderLog(lg.stdout);
+  }finally{busy=false;}
+}
+
+let stopArm=null;
+const disarm=()=>{if(stopArm){clearTimeout(stopArm);stopArm=null;$('#b-stop').textContent='Stop';}};
+document.querySelectorAll('button[data-act]').forEach(btn=>btn.addEventListener('click',async()=>{
+  if(btn.dataset.act==='stop'){
+    if(!stopArm){
+      btn.textContent='Tap again: stop and remove all routes';
+      stopArm=setTimeout(()=>{stopArm=null;btn.textContent='Stop';},4000);
+      return;
+    }
+  }
+  disarm();
+  const all=document.querySelectorAll('button[data-act]');
+  all.forEach(x=>x.disabled=true);
+  await sh(CTL+' '+btn.dataset.act);
+  all.forEach(x=>x.disabled=false);
+  busy=false;refresh();
+}));
+document.addEventListener('visibilitychange',refresh);
+refresh();setInterval(refresh,5000);
+</script>
+</body>
+</html>
